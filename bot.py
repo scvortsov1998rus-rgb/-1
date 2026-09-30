@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]  # например @my_f1_channel
@@ -72,15 +72,143 @@ def esc(s):
     return html.escape(s, quote=False)
 
 
+def looks_russian(text):
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    ru = sum(1 for c in letters if "а" <= c.lower() <= "я" or c.lower() == "ё")
+    return ru / len(letters) > 0.4
+
+
 def tr(text):
+    """Перевод на русский. Возвращает None, если перевести не удалось."""
     text = (text or "").strip()
     if not text:
         return ""
+    providers = (
+        lambda: GoogleTranslator(source="en", target="ru"),
+        lambda: MyMemoryTranslator(source="en-GB", target="ru-RU"),
+    )
+    for make in providers:
+        try:
+            out = (make().translate(text[:450]) or "").strip()
+            if out and looks_russian(out):
+                return out
+        except Exception as e:
+            print("translate failed:", repr(e)[:200])
+    return None
+
+
+def tr_required(text):
+    out = tr(text)
+    if out is None:
+        raise RuntimeError("translation failed, will retry on next run")
+    return out
+
+
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL") or "claude-sonnet-5-5"
+
+# Голос канала. Меняйте этот текст, чтобы поменять манеру письма.
+STYLE = (
+    "Ты — ведущий копирайтер русскоязычного медиа о Формуле 1, автор мирового уровня с безупречным "
+    "чувством русского языка: точные глаголы, живой ритм, меткие образы без пафоса и штампов. "
+    "Пишешь как человек, а не как переводчик.\n"
+    "Правила:\n"
+    "- Никакой кальки с английского, канцелярита и заезженных оборотов («стало известно», «в рамках», "
+    "«напомним», «не обошлось без»).\n"
+    "- Чередуй короткие и длинные предложения. Максимум одна метафора на текст, и только удачная.\n"
+    "- Заголовок цепляет, но не обманывает.\n"
+    "- Факты строго из материала: не выдумывай цифры, цитаты, причины и прогнозы.\n"
+    "- Имена, команды и трассы пиши так, как принято у российских болельщиков.\n"
+    "- Без эмодзи, хэштегов, markdown и упоминания источника."
+)
+
+
+def claude(prompt, max_tokens=500):
+    """Запрос к Claude. Возвращает текст или None (нет ключа / ошибка)."""
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        return None
     try:
-        return GoogleTranslator(source="en", target="ru").translate(text[:4500]) or text
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": max_tokens,
+                "system": STYLE,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=90,
+        )
+        r.raise_for_status()
+        return r.json()["content"][0]["text"].strip()
     except Exception as e:
-        print("translate failed:", e)
-        return text
+        print("claude failed:", repr(e)[:200])
+        return None
+
+
+def claude_rewrite(it):
+    """Новость -> (заголовок, текст), написанные заново в голосе канала."""
+    out = claude(
+        "Напиши пост для канала по материалу ниже.\n"
+        "Формат: первая строка — заголовок (до 80 символов), затем пустая строка, затем 2-4 предложения.\n\n"
+        f"Заголовок: {it['title']}\nОписание: {it['summary']}",
+        600,
+    )
+    if not out:
+        return None
+    head, _, body = out.partition("\n")
+    head = head.strip().strip("*#\"«» ")
+    body = body.strip().replace("**", "")
+    if head and looks_russian(head) and len(head) <= 150 and len(body) <= 1200:
+        return head, body
+    return None
+
+
+def flair(task, fallback=""):
+    """Одна яркая фраза-подводка. Без ключа или при ошибке вернёт fallback."""
+    out = claude(
+        task + "\nОтвет: одна фраза до 120 символов, без кавычек и эмодзи.", 150
+    )
+    if out:
+        out = out.split("\n")[0].strip().strip("\"«»* ")
+        if out and looks_russian(out) and len(out) <= 200:
+            return out
+    return fallback
+
+
+def prepare_post(it):
+    ru = claude_rewrite(it)
+    if ru:
+        return ru
+    title = tr(it["title"])
+    if not title:
+        return None
+    summary = tr(it["summary"]) if it["summary"] else ""
+    return title, summary or ""
+
+
+SOURCE_NAMES = {
+    "motorsport.com": "Motorsport.com",
+    "autosport.com": "Autosport",
+    "bbc.co.uk": "BBC Sport",
+    "bbc.com": "BBC Sport",
+    "bbci.co.uk": "BBC Sport",
+    "formula1.com": "Formula 1",
+}
+
+
+def source_name(host):
+    host = host.replace("www.", "")
+    for dom, name in SOURCE_NAMES.items():
+        if host.endswith(dom):
+            return name
+    return host.split(".")[0].title()
 
 
 def send(text, preview=False):
@@ -141,7 +269,7 @@ def fetch_news():
                     "title": title.strip(),
                     "summary": clean_summary(e.get("summary", "")),
                     "published": published,
-                    "source": urlparse(link).netloc.replace("www.", ""),
+                    "source": source_name(urlparse(link).netloc),
                 }
             )
     items.sort(key=lambda x: x["published"], reverse=True)
@@ -169,8 +297,17 @@ def task_news(state):
         candidates.append(it)
 
     limit = 2 if first_run else MAX_NEWS_PER_RUN
-    to_post = candidates[:limit][::-1]  # сначала самые старые
-    posting = {it["link"] for it in to_post}
+    ready, held = [], set()
+    for it in candidates:
+        if len(ready) >= limit:
+            break
+        post = prepare_post(it)
+        if post:
+            ready.append((it, post))
+        else:
+            held.add(it["link"])  # не перевелось — попробуем при следующем запуске
+            print("skip (no translation):", it["title"])
+    posting = {it["link"] for it, _ in ready} | held
 
     # всё остальное считаем просмотренным, чтобы не постить «хвосты»
     for it in items:
@@ -178,14 +315,12 @@ def task_news(state):
             seen.append(it["link"])
             seen_set.add(it["link"])
 
-    for it in to_post:
-        title = tr(it["title"])
-        summary = tr(it["summary"]) if it["summary"] else ""
+    for it, (title, body) in reversed(ready):  # сначала самые старые
         text = f"🏎 <b>{esc(title)}</b>"
-        if summary:
-            text += f"\n\n{esc(summary)}"
-        text += f'\n\n<a href="{html.escape(it["link"])}">Источник: {esc(it["source"])}</a>'
-        send(text, preview=True)
+        if body:
+            text += f"\n\n{esc(body)}"
+        text += f"\n\nИсточник: {esc(it['source'])}"
+        send(text)
         seen.append(it["link"])
         print("posted news:", it["title"])
 
@@ -207,7 +342,7 @@ def race_sessions(race):
 
 
 def race_title(race):
-    return tr(race["raceName"])
+    return tr_required(race["raceName"])
 
 
 def task_schedule(state):
@@ -225,13 +360,18 @@ def task_schedule(state):
     previews = state.setdefault("preview", [])
     if key not in previews and first_start - now <= PREVIEW_BEFORE:
         c = upcoming["Circuit"]
-        place = tr(f"{c['circuitName']}, {c['Location']['locality']}, {c['Location']['country']}")
-        lines = [f"🏁 <b>{esc(race_title(upcoming))} — уикенд уже скоро!</b>"]
+        place_en = f"{c['circuitName']}, {c['Location']['locality']}, {c['Location']['country']}"
+        place = tr(place_en) or place_en
+        gp = race_title(upcoming)
+        lines = [f"🏁 <b>{esc(gp)} — уикенд уже скоро!</b>"]
+        hook = flair(f"Подводка к анонсу гоночного уикенда: {gp}, трасса {place}. Без прогнозов и цифр.")
+        if hook:
+            lines.append(f"<i>{esc(hook)}</i>")
         lines.append(f"📍 {esc(place)}")
-        lines.append(f"🔢 Этап {upcoming['round']} сезона {upcoming['season']}")
-        lines.append(f"\n🗓 <b>Расписание ({TZ_LABEL}):</b>")
+        lines.append(f"Этап {upcoming['round']} сезона {upcoming['season']}")
+        lines.append(f"\n📅 <b>Расписание ({TZ_LABEL}):</b>")
         for name, d in sessions:
-            mark = "🏆" if name == "Гонка" else "▫️"
+            mark = "🏆" if name == "Гонка" else "🔹"
             lines.append(f"{mark} {fmt_dt(d)} — {name}")
         send("\n".join(lines))
         previews.append(key)
@@ -241,9 +381,11 @@ def task_schedule(state):
     reminders = state.setdefault("reminder", [])
     if key not in reminders and timedelta(0) < race_start - now <= REMINDER_BEFORE:
         local = race_start.astimezone(TZ)
+        gp = race_title(upcoming)
+        hook = flair(f"Напоминание, что гонка {gp} скоро стартует. Без прогнозов.", "Скоро погаснут красные огни")
         send(
-            f"🚦 <b>{esc(race_title(upcoming))}</b> — старт гонки сегодня в "
-            f"<b>{local:%H:%M} {TZ_LABEL}</b>!\nСкоро погаснут красные огни 🔴🔴🔴🔴🔴"
+            f"🚦 <b>{esc(gp)}</b> — старт гонки сегодня в "
+            f"<b>{local:%H:%M} {TZ_LABEL}</b>!\n{esc(hook)} 🔴🔴🔴🔴🔴"
         )
         reminders.append(key)
         print("posted reminder", key)
@@ -266,7 +408,16 @@ def task_results(state):
         done.append(key)  # слишком старое — не постим
         return
 
-    lines = [f"🏆 <b>Итоги: {esc(race_title(race))}</b>\n"]
+    gp = race_title(race)
+    podium = ", ".join(
+        f"{x['Driver']['givenName']} {x['Driver']['familyName']} ({x['Constructor']['name']})"
+        for x in race["Results"][:3]
+    )
+    hook = flair(f"Подводка к итогам гонки {gp}. Подиум по порядку: {podium}. Опирайся только на эти факты.")
+    lines = [f"🏆 <b>Итоги: {esc(gp)}</b>"]
+    if hook:
+        lines.append(f"<i>{esc(hook)}</i>")
+    lines.append("")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for res in race["Results"][:10]:
         pos = int(res["position"])
